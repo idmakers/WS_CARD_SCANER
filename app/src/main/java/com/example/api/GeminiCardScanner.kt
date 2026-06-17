@@ -24,7 +24,7 @@ data class CardScanResult(
 
 object GeminiCardScanner {
     private const val TAG = "GeminiCardScanner"
-    private const val MODEL_NAME = "gemini-2.5-flash"
+    private const val MODEL_NAME = "gemini-3.1-flash-lite"
     
     // Configured with high timeouts for image processing
     private val client = OkHttpClient.Builder()
@@ -81,20 +81,8 @@ object GeminiCardScanner {
             val bitmap = resizeBitmapIfRequired(rawBitmap, 1600)
             Log.d(TAG, "Attempting Cloud Vision OCR first...")
             val ocrText = CloudVisionOCR.performOcr(bitmap)
-            
-            // 1. Guard: If OCR detects absolutely nothing and we are under continuous mode,
-            // we reject early to protect against processing empty background frames.
-            // If we are under standard single mode, we always proceed so Gemini can scan visually.
-            if (isContinuousMode && ocrText.isNullOrBlank()) {
-                Log.d(TAG, "Continuous mode OCR output is empty. Rejecting to protect against burning tokens.")
-                return@withContext CardScanResult(
-                    name = "",
-                    serialNumber = "",
-                    error = "影像未讀取到任何文字，已自動跳過空畫面 (省 Flow 保護模式)"
-                )
-            }
 
-            // 2. Local Acceleration: If the recognized OCR text matches a card we already have inside our inventory db,
+            // 1. Local Acceleration: If the recognized OCR text matches a card we already have inside our inventory db,
             // we bypass the Gemini network API entirely!
             val normalizedOcr = normalizeSerial(ocrText ?: "")
             val matchedFromInventory = knownCards.firstOrNull { card ->
@@ -186,6 +174,8 @@ object GeminiCardScanner {
             val requestBody = requestJson.toString().toRequestBody(mediaType)
             
             val candidateModels = listOf(
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-flash-lite",
                 "gemini-2.5-flash",
                 "gemini-3.5-flash",
                 "gemini-3.1-pro-preview"
