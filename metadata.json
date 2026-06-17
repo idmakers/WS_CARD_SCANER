@@ -1,0 +1,6 @@
+{
+  "name": "Card Scanner & Tracker",
+  "description": "An automated trading card scanner that extracts card names and serials based on color configurations, manages inventory, filters data, and exports analysis to Excel/CSV.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
