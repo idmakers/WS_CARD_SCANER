@@ -79,35 +79,10 @@ object GeminiCardScanner {
 
         try {
             val bitmap = resizeBitmapIfRequired(rawBitmap, 1600)
-            Log.d(TAG, "Attempting Cloud Vision OCR first...")
-            val ocrText = CloudVisionOCR.performOcr(bitmap)
-
-            // 1. Local Acceleration: If the recognized OCR text matches a card we already have inside our inventory db,
-            // we bypass the Gemini network API entirely!
-            val normalizedOcr = normalizeSerial(ocrText ?: "")
-            val matchedFromInventory = knownCards.firstOrNull { card ->
-                val normKnownSc = normalizeSerial(card.serialNumber)
-                normKnownSc.isNotEmpty() && normalizedOcr.contains(normKnownSc)
-            }
-
-            if (matchedFromInventory != null) {
-                Log.d(TAG, "⚡ Local Cache hit! Found matching card serial: ${matchedFromInventory.serialNumber} inside OCR output.")
-                return@withContext CardScanResult(
-                    name = matchedFromInventory.name,
-                    serialNumber = matchedFromInventory.serialNumber,
-                    traits = matchedFromInventory.traits ?: "本地快速快取 (未重合模型)"
-                )
-            }
-            
-            val ocrHintsText = if (!ocrText.isNullOrBlank()) {
-                "OCR system transcribed the following text suggestions (treat as hints, correct any errors based on the high-resolution image):\n\"\"\"\n$ocrText\n\"\"\""
-            } else {
-                "No OCR text hints available; rely 100% on the visual image."
-            }
 
             val promptText = """
                 You are an elite trading card recognition AI.
-                Your task is to scan the card image AND analyze any OCR hints to extract and format:
+                Your task is to scan the high-resolution card image directly to extract and format:
                 1. 名稱 (Name): The character or card title in Japanese or Chinese. E.g. "プロレベルのベーシスト 八幡海鈴" (usually placed inside the main character text label).
                 2. 序號 (Serial number / ID): The precise Weiss Schwarz serial.
                 3. 特色屬性 (Traits / Attributes): Labeled properties (comma-separated, e.g. "音樂, Ave Mujica").
@@ -123,14 +98,11 @@ object GeminiCardScanner {
                 - Example 3: `BD/W125-005 R`
                 - Example 4: `BD/W125-083 U`
                 
-                OCR Correction rules:
-                - Slashes '/' are often misread as '1', '|', 'I', 'l', or '`'. Correct them back to '/' (e.g., if you see "BD1W125" or "BD|W125" or "BDlW125", CORRECT IT to "BD/W125").
+                Image verification rules:
+                - Slashes '/' should not be misread as '1', '|', 'I', 'l', or '`'. Format standard Weiss Schwarz card identifier carefully as "BD/W125".
                 - Hyphens '-' must be preserved between the card ID and Card Number.
                 - Rarity classes like C, U, R, RR, SR, SP, SEC, OFR, CR, CC must be at the very end and prefixed with a space.
                 - Never guess random letters or formats. Match the visual presentation exactly.
-                
-                OCR INPUT SCHEME:
-                $ocrHintsText
                 
                 RESPONSE FORM:
                 Return raw valid JSON matching the exact schema requirements.

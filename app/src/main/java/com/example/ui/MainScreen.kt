@@ -27,6 +27,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -41,6 +42,18 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.google.accompanist.permissions.rememberPermissionState
+import com.google.accompanist.permissions.isGranted
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import kotlinx.coroutines.delay
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.CardEntity
 import java.io.InputStream
@@ -97,9 +110,38 @@ fun MainScreen(viewModel: CardViewModel = viewModel()) {
     // Choose dynamic card bitmap generated initially or dynamically
     var activeBitmap by remember { mutableStateOf<Bitmap?>(null) }
     
+    // In-app camera and continuous auto-simulation states
+    var isCustomCameraOpen by remember { mutableStateOf(false) }
+    var isSimAutoPlaying by remember { mutableStateOf(false) }
+    var simSerialIndex by remember { mutableStateOf(1) }
+    
     // Initializer sample card on startup
     LaunchedEffect(Unit) {
         activeBitmap = generateCardSampleBitmap(customName, customSerial, customTraits)
+    }
+
+    // Auto-continuous simulation scanning loop (Runs directly on browser emulator/development env)
+    LaunchedEffect(isSimAutoPlaying) {
+        if (isSimAutoPlaying) {
+            while (isSimAutoPlaying) {
+                if (!viewModel.isTester && viewModel.remainingScans <= 0) {
+                    isSimAutoPlaying = false
+                    Toast.makeText(context, "餘額不足，模擬連拍已停止！", Toast.LENGTH_LONG).show()
+                    break
+                }
+                
+                val nameWithSuffix = if (customName.isBlank()) "超級噴火龍" else "$customName #$simSerialIndex"
+                val serialWithSuffix = if (customSerial.isBlank()) "001-025" else "$customSerial-S$simSerialIndex"
+                val traitsWithSuffix = if (customTraits.isBlank()) "火屬性, 一擊" else customTraits
+                
+                val cardBmp = generateCardSampleBitmap(nameWithSuffix, serialWithSuffix, traitsWithSuffix)
+                activeBitmap = cardBmp
+                viewModel.scanCardImage(cardBmp, forceContinuous = true) // Automatically processes continuous task, cuts remaining counts
+                
+                simSerialIndex += 1
+                delay(3000) // Trigger next scan every 3 seconds
+            }
+        }
     }
 
     // Media picking handler
@@ -143,6 +185,20 @@ fun MainScreen(viewModel: CardViewModel = viewModel()) {
                 }
             }
         }
+    }
+
+    if (isCustomCameraOpen) {
+        InAppCameraDialog(
+            remainingScans = viewModel.remainingScans,
+            isTester = viewModel.isTester,
+            onPhotoCaptured = { bitmap ->
+                activeBitmap = bitmap
+                viewModel.scanCardImage(bitmap, forceContinuous = true) // Automatically streams to continuous processing in background
+            },
+            onClose = {
+                isCustomCameraOpen = false
+            }
+        )
     }
 
     Scaffold(
@@ -235,24 +291,33 @@ fun MainScreen(viewModel: CardViewModel = viewModel()) {
                         },
                         onTriggerGallery = { imagePickerLauncher.launch("image/*") },
                         onTriggerCamera = {
-                            try {
-                                val file = java.io.File.createTempFile("temp_card_", ".jpg", context.cacheDir)
-                                val uri = androidx.core.content.FileProvider.getUriForFile(
-                                    context,
-                                    "${context.packageName}.fileprovider",
-                                    file
-                                )
-                                photoUri = uri
-                                cameraLauncher.launch(uri)
-                            } catch (e: Exception) {
-                                Toast.makeText(context, "啟動相機失敗: ${e.message}", Toast.LENGTH_SHORT).show()
-                            }
+                            isCustomCameraOpen = true
                         },
                         onDismissStates = { viewModel.dismissScanStates() },
                         isContinuousMode = viewModel.isContinuousMode,
                         onToggleContinuousMode = { viewModel.toggleContinuousMode() },
                         activeBackgroundScans = viewModel.activeBackgroundScans,
-                        onRemoveScanTask = { viewModel.removeScanTask(it) }
+                        onRemoveScanTask = { viewModel.removeScanTask(it) },
+                        remainingScans = viewModel.remainingScans,
+                        isTester = viewModel.isTester,
+                        isSimAutoPlaying = isSimAutoPlaying,
+                        onToggleSimAutoPlay = { isSimAutoPlaying = !isSimAutoPlaying }
+                    )
+                }
+
+                // Billing / Membership / Token Shop Center
+                item {
+                    BillingStorePanel(
+                        remainingScans = viewModel.remainingScans,
+                        subscriptionLevel = viewModel.subscriptionLevel,
+                        purchasedTokenCount = viewModel.purchasedTokenCount,
+                        userEmail = viewModel.userEmail,
+                        isTester = viewModel.isTester,
+                        onUpdateEmail = { viewModel.updateUserEmail(it) },
+                        onBuyToken = { viewModel.buyTokenPackage() },
+                        onSubscribeTier1 = { viewModel.subscribeTier1() },
+                        onSubscribeTier2 = { viewModel.subscribeTier2() },
+                        onResetBilling = { viewModel.cancelSubscriptionAndReset() }
                     )
                 }
 
@@ -487,7 +552,11 @@ fun ScannerPanel(
     isContinuousMode: Boolean,
     onToggleContinuousMode: () -> Unit,
     activeBackgroundScans: List<BackgroundScanTask>,
-    onRemoveScanTask: (BackgroundScanTask) -> Unit
+    onRemoveScanTask: (BackgroundScanTask) -> Unit,
+    remainingScans: Int,
+    isTester: Boolean = false,
+    isSimAutoPlaying: Boolean = false,
+    onToggleSimAutoPlay: () -> Unit = {}
 ) {
     var showCustomDesignPanel by remember { mutableStateOf(false) }
 
@@ -539,76 +608,40 @@ fun ScannerPanel(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Pro / Premium continuous batch mode unlock indicator & switcher
-            Surface(
-                color = Color(0xFFEEF2FF), // Indigo 50 background
-                border = BorderStroke(1.dp, Color(0xFFC7D2FE)), // Indigo 200 border
-                shape = RoundedCornerShape(12.dp),
+            // Elegant small status row of scanning credits
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 4.dp)
+                    .padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.OfflineBolt,
+                        contentDescription = "Fast continuous scanning enabled",
+                        tint = Color(0xFF6366F1),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "極速連拍 / 模擬連拍：已整合就緒",
+                        color = Color(0xFF4338CA),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Surface(
+                    color = if (isTester) Color(0xFF8B5CF6) else (if (remainingScans > 0) Color(0xFF10B981) else Color(0xFFEF4444)),
+                    shape = RoundedCornerShape(6.dp)
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "快速連拍連續掃描",
-                                color = Color(0xFF3730A3), // Indigo 800
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Surface(
-                                color = Color(0xFFFACC15), // Gold golden badge
-                                shape = RoundedCornerShape(4.dp)
-                            ) {
-                                Text(
-                                    text = "👑 VIP專享",
-                                    color = Color(0xFF78350F),
-                                    fontSize = 8.sp,
-                                    fontWeight = FontWeight.Black,
-                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Surface(
-                                color = Color(0xFF22C55E),
-                                shape = RoundedCornerShape(4.dp)
-                            ) {
-                                Text(
-                                    text = "測試號免付費",
-                                    color = Color.White,
-                                    fontSize = 8.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                )
-                            }
-                        }
-                        Text(
-                            text = "無需停留在結果對話框！直接連續拍攝複數卡片，AI 將以多執行緒背景掃描並直接增添統計！",
-                            color = Color(0xFF4338CA), // Indigo 700
-                            fontSize = 11.sp,
-                            lineHeight = 15.sp,
-                            modifier = Modifier.padding(top = 2.dp)
-                        )
-                    }
-                    
-                    Switch(
-                        checked = isContinuousMode,
-                        onCheckedChange = { onToggleContinuousMode() },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = Color.White,
-                            checkedTrackColor = Color(0xFF4F46E5),
-                            uncheckedThumbColor = Color(0xFF94A3B8),
-                            uncheckedTrackColor = Color(0xFFE2E8F0)
-                        ),
-                        modifier = Modifier.testTag("continuous_mode_switch")
+                    Text(
+                        text = if (isTester) "⚡ 開發帳號：無限次" else "🔋 剩餘辨識額度: $remainingScans 次",
+                        color = Color.White,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
                     )
                 }
             }
@@ -701,19 +734,49 @@ fun ScannerPanel(
                         singleLine = true
                     )
 
-                    Button(
-                        onClick = onGenerateAndScan,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF6750A4)
-                        ),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("generate_scan_button")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(Icons.Default.AutoMode, contentDescription = "Simulate", modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("套用色彩配置並送出 AI 辨識", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Button(
+                            onClick = onGenerateAndScan,
+                            enabled = !isSimAutoPlaying,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF6750A4)
+                            ),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("generate_scan_button")
+                        ) {
+                            Icon(Icons.Default.AutoMode, contentDescription = "Simulate", modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("單次模擬辨識", fontWeight = FontWeight.Bold, fontSize = 11.sp, maxLines = 1)
+                        }
+
+                        Button(
+                            onClick = onToggleSimAutoPlay,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isSimAutoPlaying) Color(0xFFEF4444) else Color(0xFF10B981)
+                            ),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1.2f)
+                                .testTag("toggle_sim_auto_button")
+                        ) {
+                            Icon(
+                                imageVector = if (isSimAutoPlaying) Icons.Default.StopCircle else Icons.Default.PlayCircle,
+                                contentDescription = "Sim Auto Play",
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isSimAutoPlaying) "停止自動模擬" else "⚡ 啟動模擬連拍",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.sp,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
             }
@@ -757,7 +820,7 @@ fun ScannerPanel(
                 }
 
                 // Scanning Progress Overlay
-                if (isScanning && !isContinuousMode) {
+                if (isScanning) {
                     Box(
                         modifier = Modifier
                             .matchParentSize()
@@ -822,7 +885,7 @@ fun ScannerPanel(
             }
 
             // Continuous Background Tasks List (Renderer inside panel)
-            if (isContinuousMode && activeBackgroundScans.isNotEmpty()) {
+            if (activeBackgroundScans.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(16.dp))
                 Column(
                     modifier = Modifier
@@ -946,7 +1009,7 @@ fun ScannerPanel(
             }
 
             // Results Popup Alert after recognition completes (In standard mode only)
-            if (!isContinuousMode && (lastScannedCard != null || scanError != null)) {
+            if (lastScannedCard != null || scanError != null) {
                 Spacer(modifier = Modifier.height(16.dp))
                 
                 Surface(
@@ -1065,6 +1128,415 @@ fun ScannerPanel(
                                 )
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun BillingStorePanel(
+    remainingScans: Int,
+    subscriptionLevel: Int,
+    purchasedTokenCount: Int,
+    userEmail: String,
+    isTester: Boolean,
+    onUpdateEmail: (String) -> Unit,
+    onBuyToken: () -> Unit,
+    onSubscribeTier1: () -> Unit,
+    onSubscribeTier2: () -> Unit,
+    onResetBilling: () -> Unit
+) {
+    val context = LocalContext.current
+    var emailInput by remember(userEmail) { mutableStateOf(userEmail) }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("billing_store_panel"),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        border = BorderStroke(1.dp, Color(0xFFE2E8F0)),
+        shape = RoundedCornerShape(16.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            // Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Wallet,
+                    contentDescription = "Wallet Icon",
+                    tint = Color(0xFF6366F1), // Indigo
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "會員商城與額度儲值",
+                    color = Color(0xFF1E293B),
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 16.sp,
+                    letterSpacing = (-0.3).sp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // User Email Account Binder (Dynamic Test Verification input)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+            ) {
+                Text(
+                    text = "綁定會員/測試帳號電子信箱：",
+                    color = Color(0xFF64748B),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = emailInput,
+                        onValueChange = { newValue ->
+                            emailInput = newValue
+                            onUpdateEmail(newValue)
+                        },
+                        placeholder = { Text("請輸入電子郵件...", fontSize = 12.sp, color = Color.Gray) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color(0xFF1E293B),
+                            unfocusedTextColor = Color(0xFF1E293B),
+                            focusedContainerColor = Color(0xFFF8FAFC),
+                            unfocusedContainerColor = Color(0xFFF8FAFC),
+                            focusedBorderColor = Color(0xFF6366F1),
+                            unfocusedBorderColor = Color(0xFFE2E8F0)
+                        )
+                    )
+                    
+                    if (emailInput.isNotBlank()) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                onUpdateEmail(emailInput)
+                                if (isTester) {
+                                    Toast.makeText(context, "🎉 測試帳號 idmakers@gmail.com 啟用！無限連拍已解鎖！", Toast.LENGTH_LONG).show()
+                                } else {
+                                    Toast.makeText(context, "帳號已綁定！", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isTester) Color(0xFF8B5CF6) else Color(0xFF6366F1)
+                            ),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.height(48.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp)
+                        ) {
+                            Text(
+                                text = if (isTester) "⚡ 開發認證" else "儲存帳號",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+                
+                // Show tester dynamic success status indicator
+                if (isTester) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Surface(
+                        color = Color(0xFFF5F3FF),
+                        shape = RoundedCornerShape(6.dp),
+                        border = BorderStroke(1.dp, Color(0xFFDDD6FE)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Active Tester",
+                                tint = Color(0xFF8B5CF6),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "開發者測試帳號驗證成功！享無限連拍免扣額保護 (免點數免金流)",
+                                color = Color(0xFF6D28D9),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Current Status Summary Card
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        brush = Brush.horizontalGradient(
+                            colors = if (isTester) {
+                                listOf(Color(0xFFF5F3FF), Color(0xFFEDE9FE)) // Light violet gradient for developers
+                            } else {
+                                listOf(Color(0xFFF1F5F9), Color(0xFFE2E8F0))
+                            }
+                        ),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .padding(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "當前帳戶狀態",
+                            color = Color(0xFF64748B),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(top = 4.dp)
+                        ) {
+                            Text(
+                                text = when {
+                                    isTester -> "⚡ 專屬開發者測試帳戶"
+                                    subscriptionLevel == 1 -> "⭐ 第一級付費會員"
+                                    subscriptionLevel == 2 -> "👑 第二級鑽石會員"
+                                    else -> "👤 一般試用帳號"
+                                },
+                                color = if (isTester) Color(0xFF6D28D9) else Color(0xFF0F172A),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                            if (!isTester && purchasedTokenCount > 0) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Surface(
+                                    color = Color(0xFFEEF2FF),
+                                    shape = RoundedCornerShape(4.dp)
+                                ) {
+                                    Text(
+                                        text = "已購代幣 ×$purchasedTokenCount",
+                                        color = Color(0xFF4F46E5),
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(
+                            text = "剩餘連拍量",
+                            color = Color(0xFF64748B),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (isTester) "無限次數" else "$remainingScans 次",
+                            color = if (isTester) Color(0xFF8B5CF6) else (if (remainingScans > 0) Color(0xFF10B981) else Color(0xFFEF4444)),
+                            fontWeight = FontWeight.Black,
+                            fontSize = 18.sp,
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(
+                text = "請選擇儲值或訂閱方案 (免綁卡一鍵模擬支付)：",
+                color = Color(0xFF475569),
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(bottom = 10.dp)
+            )
+
+            // Dynamic Billing Grid Options
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                // Token Package: NT$30 -> 100 scans
+                BillingStoreItem(
+                    title = "代幣儲值包",
+                    desc = "單次增量（最適合輕度與短時使用）",
+                    quotaText = "增加 100 次連續連拍",
+                    priceText = "NT$ 30 元",
+                    borderColor = Color(0xFFE2E8F0),
+                    buttonColor = Color(0xFF475569),
+                    badgeText = "💰 最彈性",
+                    onClick = {
+                        onBuyToken()
+                    }
+                )
+
+                // Tier 1 Membership: NT$99/month -> 1000 scans
+                BillingStoreItem(
+                    title = "【第一級】付費大師會員",
+                    desc = "月費制（狂熱玩家首選，全面提升效率）",
+                    quotaText = "立即獲得 1,000 次連拍額度",
+                    priceText = "NT$ 99 元 /月",
+                    borderColor = Color(0xFFC7D2FE),
+                    buttonColor = Color(0xFF4F46E5),
+                    badgeText = "⭐ 第一級付費",
+                    isSubscribed = subscriptionLevel == 1,
+                    onClick = {
+                        onSubscribeTier1()
+                    }
+                )
+
+                // Tier 2 Membership: NT$199/month -> 10000 scans
+                BillingStoreItem(
+                    title = "【第二級】卡牌鑽石豪客",
+                    desc = "最高規（統計工作室、全能實卡收藏家必備）",
+                    quotaText = "立即注入 10,000 次連拍額度",
+                    priceText = "NT$ 199 元 /月",
+                    borderColor = Color(0xFFFDE047),
+                    buttonColor = Color(0xFFCA8A04),
+                    badgeText = "👑 卡牌鑽石",
+                    isSubscribed = subscriptionLevel == 2,
+                    onClick = {
+                        onSubscribeTier2()
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Reset and restore demo action button
+            TextButton(
+                onClick = onResetBilling,
+                colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF94A3B8)),
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Refresh,
+                    contentDescription = "Reset State",
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "重置為全新 50 次試用帳戶",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun BillingStoreItem(
+    title: String,
+    desc: String,
+    quotaText: String,
+    priceText: String,
+    borderColor: Color,
+    buttonColor: Color,
+    badgeText: String,
+    isSubscribed: Boolean = false,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(if (isSubscribed) 2.dp else 1.dp, if (isSubscribed) buttonColor else borderColor),
+        color = if (isSubscribed) buttonColor.copy(alpha = 0.03f) else Color.White
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = title,
+                        color = Color(0xFF0F172A),
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        color = buttonColor.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = badgeText,
+                            color = buttonColor,
+                            fontSize = 8.sp,
+                            fontWeight = FontWeight.Black,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Text(
+                    text = desc,
+                    color = Color(0xFF64748B),
+                    fontSize = 10.sp,
+                    lineHeight = 14.sp,
+                    modifier = Modifier.padding(vertical = 2.dp)
+                )
+                Text(
+                    text = quotaText,
+                    color = buttonColor,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = priceText,
+                    color = Color(0xFF1E293B),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Button(
+                    onClick = onClick,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isSubscribed) Color(0xFF10B981) else buttonColor,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.height(28.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = if (isSubscribed) Icons.Default.Check else Icons.Default.ShoppingCart,
+                            contentDescription = "Buy",
+                            modifier = Modifier.size(12.dp),
+                            tint = Color.White
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (isSubscribed) "已訂閱" else "立即模擬製單",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }
@@ -1423,6 +1895,417 @@ fun EmptyWorkspace() {
             modifier = Modifier.padding(top = 6.dp)
         )
     }
+}
+
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+fun InAppCameraDialog(
+    remainingScans: Int,
+    isTester: Boolean,
+    onPhotoCaptured: (Bitmap) -> Unit,
+    onClose: () -> Unit
+) {
+    val context = LocalContext.current
+    
+    // Permission Handling
+    val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
+    
+    // Shutter capture engine
+    val imageCapture = remember { ImageCapture.Builder().build() }
+    
+    // Auto shutter timing control
+    var isAutoShutterActive by remember { mutableStateOf(false) }
+    var secondsToNextAutoShutter by remember { mutableStateOf(3) }
+    
+    // Screen Flash effect
+    var triggerFlash by remember { mutableStateOf(false) }
+    
+    // Auto Capture thread loop
+    LaunchedEffect(isAutoShutterActive) {
+        if (isAutoShutterActive) {
+            while (isAutoShutterActive) {
+                if (!isTester && remainingScans <= 0) {
+                    isAutoShutterActive = false
+                    Toast.makeText(context, "額度不足，自動拍照已停止！", Toast.LENGTH_LONG).show()
+                    break
+                }
+                
+                secondsToNextAutoShutter = 3
+                while (secondsToNextAutoShutter > 0 && isAutoShutterActive) {
+                    delay(1000)
+                    secondsToNextAutoShutter -= 1
+                }
+                
+                if (isAutoShutterActive) {
+                    // Flash feedback
+                    triggerFlash = true
+                    
+                    // Actually take picture
+                    try {
+                        val file = java.io.File.createTempFile("camera_raw_", ".jpg", context.cacheDir)
+                        val outputFileOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+                        imageCapture.takePicture(
+                            outputFileOptions,
+                            androidx.core.content.ContextCompat.getMainExecutor(context),
+                            object : ImageCapture.OnImageSavedCallback {
+                                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                                    try {
+                                        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                                        if (bitmap != null) {
+                                            val rotated = rotateImageIfRequired(context, bitmap, Uri.fromFile(file))
+                                            onPhotoCaptured(rotated)
+                                        }
+                                    } catch (e: Exception) {
+                                        android.util.Log.e("Camera", "Failed to decode background picture", e)
+                                    }
+                                }
+                                override fun onError(exception: ImageCaptureException) {
+                                    android.util.Log.e("Camera", "Failed capture", exception)
+                                }
+                            }
+                        )
+                    } catch (e: Exception) {
+                        android.util.Log.e("Camera", "Failed output", e)
+                    }
+                    
+                    delay(500) // minor rest
+                    triggerFlash = false
+                }
+            }
+        }
+    }
+
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onClose,
+        properties = androidx.compose.ui.window.DialogProperties(
+            usePlatformDefaultWidth = false
+        )
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color.Black
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                if (cameraPermissionState.status.isGranted) {
+                    // Live Viewfinder
+                    CameraPreviewView(
+                        imageCapture = imageCapture,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    
+                    // Flash White Overlay on trigger
+                    if (triggerFlash) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.White.copy(alpha = 0.8f))
+                        )
+                    }
+                    
+                    // Camera HUD Controls overlay
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        // Header bar with Info & Close
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .statusBarsPadding(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Surface(
+                                color = Color.Black.copy(alpha = 0.6f),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.FlashOn,
+                                        contentDescription = "Active info",
+                                        tint = Color.Yellow,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (isTester) "⚡ 開發認證：無限連拍中" else "🔋 剩餘次數: $remainingScans 次",
+                                        color = Color.White,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                            
+                            IconButton(
+                                onClick = onClose,
+                                modifier = Modifier
+                                    .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Close Camera",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+
+                        // Dynamic auto capture countdown indicator
+                        if (isAutoShutterActive) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.CenterHorizontally)
+                                    .background(Color(0xFF8B5CF6).copy(alpha = 0.9f), RoundedCornerShape(12.dp))
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    CircularProgressIndicator(
+                                        progress = { secondsToNextAutoShutter.toFloat() / 3f },
+                                        color = Color.White,
+                                        strokeWidth = 3.dp,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = "⏱️ $secondsToNextAutoShutter 秒後自動連拍拍照...",
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                }
+                            }
+                        }
+
+                        // Footer HUD dashboard
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = Color.Black.copy(alpha = 0.75f)
+                            ),
+                            shape = RoundedCornerShape(20.dp),
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .navigationBarsPadding()
+                                .padding(bottom = 8.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(14.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = "指向卡片以極速批次辨識 (不退回主畫面直接快拍)",
+                                    color = Color.LightGray,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.padding(bottom = 10.dp)
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // Auto capture switch toggle
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.clickable {
+                                            isAutoShutterActive = !isAutoShutterActive
+                                        }
+                                    ) {
+                                        Switch(
+                                            checked = isAutoShutterActive,
+                                            onCheckedChange = { isAutoShutterActive = it },
+                                            colors = SwitchDefaults.colors(
+                                                checkedThumbColor = Color.White,
+                                                checkedTrackColor = Color(0xFF10B981)
+                                            ),
+                                            modifier = Modifier.scale(0.85f)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = if (isAutoShutterActive) "⚡ 自動連拍：開" else "⏱️ 自動連拍：關",
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+
+                                    // Large Capture Shutter Button
+                                    FloatingActionButton(
+                                        onClick = {
+                                            if (!isTester && remainingScans <= 0) {
+                                                Toast.makeText(context, "額度已用完，無法拍照！", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                triggerFlash = true
+                                                try {
+                                                    val file = java.io.File.createTempFile("cam_manual_", ".jpg", context.cacheDir)
+                                                    val outputFileOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+                                                    imageCapture.takePicture(
+                                                        outputFileOptions,
+                                                        androidx.core.content.ContextCompat.getMainExecutor(context),
+                                                        object : ImageCapture.OnImageSavedCallback {
+                                                            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                                                                try {
+                                                                    val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                                                                    if (bitmap != null) {
+                                                                        val rotated = rotateImageIfRequired(context, bitmap, Uri.fromFile(file))
+                                                                        onPhotoCaptured(rotated)
+                                                                        Toast.makeText(context, "已新增至掃描佇列！", Toast.LENGTH_SHORT).show()
+                                                                    }
+                                                                } catch (e: Exception) {
+                                                                    Toast.makeText(context, "讀取影像異常", Toast.LENGTH_SHORT).show()
+                                                                }
+                                                            }
+                                                            override fun onError(exception: ImageCaptureException) {
+                                                                Toast.makeText(context, "拍照失敗: ${exception.message}", Toast.LENGTH_SHORT).show()
+                                                            }
+                                                        }
+                                                    )
+                                                } catch (e: Exception) {
+                                                    Toast.makeText(context, "拍照建立檔案失敗", Toast.LENGTH_SHORT).show()
+                                                }
+                                                
+                                                // Turn off flash after 250ms
+                                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                                    triggerFlash = false
+                                                }, 250)
+                                            }
+                                        },
+                                        containerColor = Color.White,
+                                        contentColor = Color.Black,
+                                        shape = CircleShape,
+                                        modifier = Modifier.size(54.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.CameraAlt,
+                                            contentDescription = "Manual Shoot",
+                                            modifier = Modifier.size(26.dp)
+                                        )
+                                    }
+
+                                    // Exit Confirmation Button
+                                    Button(
+                                        onClick = onClose,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = Color(0xFFEF4444)
+                                        ),
+                                        shape = RoundedCornerShape(10.dp),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("完成/關閉", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Request Permission Screen
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(24.dp),
+                        verticalArrangement = Arrangement.Center,
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Videocam,
+                            contentDescription = "Camera Permission Required",
+                            tint = Color.LightGray,
+                            modifier = Modifier.size(80.dp)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "需要啟用相機鏡頭權限",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Black
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "卡牌極速連續連拍模組需要使用直接相機取景預覽。這樣您就可以手持卡牌，在不關閉或跳出相機的情況下進行不限張數的連續快速連掃。",
+                            color = Color.Gray,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                            lineHeight = 18.sp
+                        )
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Button(
+                            onClick = { cameraPermissionState.launchPermissionRequest() },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF6366F1)
+                            ),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.VerifiedUser, contentDescription = "Authorize")
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("立即對本 APP 進行相機授權", fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        TextButton(onClick = onClose) {
+                            Text("暫時取消並返回", color = Color.White.copy(alpha = 0.6f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CameraPreviewView(
+    imageCapture: ImageCapture,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
+
+    DisposableEffect(lifecycleOwner) {
+        onDispose {
+            try {
+                if (cameraProviderFuture.isDone) {
+                    val cameraProvider = cameraProviderFuture.get()
+                    cameraProvider.unbindAll()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("CameraPreviewView", "Error unbinding on dispose", e)
+            }
+        }
+    }
+
+    AndroidView(
+        factory = { ctx ->
+            val previewView = PreviewView(ctx).apply {
+                scaleType = PreviewView.ScaleType.FILL_CENTER
+            }
+            cameraProviderFuture.addListener({
+                val cameraProvider = cameraProviderFuture.get()
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                try {
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        preview,
+                        imageCapture
+                    )
+                } catch (exc: Exception) {
+                    android.util.Log.e("CameraPreviewView", "Use case binding failed", exc)
+                }
+            }, androidx.core.content.ContextCompat.getMainExecutor(ctx))
+            previewView
+        },
+        modifier = modifier
+    )
 }
 
 // Dynamically draws card with "Red background white text" for Name, and "Yellow background black text" for Serial number

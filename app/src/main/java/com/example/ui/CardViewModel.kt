@@ -44,6 +44,67 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.getDatabase(application)
     private val repository = CardRepository(database.cardDao)
 
+    // SharedPreferences for persistent billing info
+    private val prefs = application.getSharedPreferences("billing_token_prefs", Context.MODE_PRIVATE)
+
+    var remainingScans by mutableStateOf(prefs.getInt("remaining_scans", 50)) // Default 50 free credits
+        private set
+
+    var subscriptionLevel by mutableStateOf(prefs.getInt("subscription_level", 0)) // 0: None, 1: Tier 1, 2: Tier 2
+        private set
+
+    var purchasedTokenCount by mutableStateOf(prefs.getInt("purchased_token_count", 0))
+        private set
+
+    var userEmail by mutableStateOf(prefs.getString("user_email", "") ?: "")
+        private set
+
+    val isTester: Boolean
+        get() = userEmail.trim().lowercase() == "idmakers@gmail.com"
+
+    fun updateUserEmail(newEmail: String) {
+        userEmail = newEmail
+        prefs.edit().putString("user_email", newEmail).apply()
+    }
+
+    private fun saveBillingState() {
+        prefs.edit().apply {
+            putInt("remaining_scans", remainingScans)
+            putInt("subscription_level", subscriptionLevel)
+            putInt("purchased_token_count", purchasedTokenCount)
+            apply()
+        }
+    }
+
+    // Purchase token package: NT$30 -> 100 scans
+    fun buyTokenPackage() {
+        purchasedTokenCount += 1
+        remainingScans += 100
+        saveBillingState()
+    }
+
+    // Subscribe Tier 1: NT$99/month -> 1,000 scans
+    fun subscribeTier1() {
+        subscriptionLevel = 1
+        remainingScans += 1000
+        saveBillingState()
+    }
+
+    // Subscribe Tier 2: NT$199/month -> 10,000 scans
+    fun subscribeTier2() {
+        subscriptionLevel = 2
+        remainingScans += 10000
+        saveBillingState()
+    }
+
+    // Cancel / Reset state to initial status
+    fun cancelSubscriptionAndReset() {
+        subscriptionLevel = 0
+        purchasedTokenCount = 0
+        remainingScans = 50 // Reset count
+        saveBillingState()
+    }
+
     // Continuous/Batch mode status (Pro unlocked feature)
     var isContinuousMode by mutableStateOf(false)
         private set
@@ -135,6 +196,26 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun scanCardImageContinuous(bitmap: Bitmap) {
+        if (!isTester && remainingScans <= 0) {
+            val task = BackgroundScanTask(
+                bitmap = bitmap,
+                status = "額度不足！請於下方選購代幣或訂閱會員方案",
+                isSuccess = false
+            )
+            activeBackgroundScans.add(0, task)
+            viewModelScope.launch {
+                kotlinx.coroutines.delay(10000)
+                activeBackgroundScans.removeAll { it.id == task.id }
+            }
+            return
+        }
+
+        // Deduct 1 credit for continuous scan and save (Skip if tester)
+        if (!isTester) {
+            remainingScans--
+            saveBillingState()
+        }
+
         val task = BackgroundScanTask(bitmap = bitmap)
         activeBackgroundScans.add(0, task) // Add to top of queue
         val known = cardsState.value
@@ -183,11 +264,22 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // Process of scanning image via Gemini API with colors recognition rule
-    fun scanCardImage(bitmap: Bitmap) {
-        if (isContinuousMode) {
+    fun scanCardImage(bitmap: Bitmap, forceContinuous: Boolean = false) {
+        if (isContinuousMode || forceContinuous) {
             scanCardImageContinuous(bitmap)
             return
         }
+        if (!isTester && remainingScans <= 0) {
+            scanError = "您的剩餘掃描次數不足！請於下方選購代幣或訂閱會員方案"
+            return
+        }
+
+        // Deduct 1 credit for scan and save (Skip if tester)
+        if (!isTester) {
+            remainingScans--
+            saveBillingState()
+        }
+
         val known = cardsState.value
         viewModelScope.launch {
             isScanning = true
