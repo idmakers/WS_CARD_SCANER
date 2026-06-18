@@ -12,6 +12,10 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.google.android.gms.tasks.Tasks
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 
@@ -19,12 +23,105 @@ data class CardScanResult(
     val name: String,
     val serialNumber: String,
     val traits: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val isFromCache: Boolean = false,
+    val isFromLocalOcr: Boolean = false
 )
 
 object GeminiCardScanner {
     private const val TAG = "GeminiCardScanner"
     private const val MODEL_NAME = "gemini-3.1-flash-lite"
+
+    private fun findWSSerialInText(text: String): String? {
+        val lines = text.split("\n")
+        val regex = java.util.regex.Pattern.compile(
+            "([A-Za-z0-9]+)/([A-Za-z0-9]+)-([A-Za-z0-9]+)(?:\\s+([A-Za-z]+))?",
+            java.util.regex.Pattern.CASE_INSENSITIVE
+        )
+        for (line in lines) {
+            val cell = line.trim()
+                .replace("\\", "/")
+                .replace("|", "/")
+            val matcher = regex.matcher(cell)
+            if (matcher.find()) {
+                val matched = matcher.group(0) ?: ""
+                if (matched.isNotEmpty()) {
+                    return matched
+                }
+            }
+        }
+        return null
+    }
+
+    data class CacheEntry(
+        val dHash: Long,
+        val result: CardScanResult,
+        val timestamp: Long = System.currentTimeMillis()
+    )
+
+    private val scanCache = mutableListOf<CacheEntry>()
+    private const val MAX_CACHE_SIZE = 10
+
+    private fun calculateDHash(bitmap: Bitmap): Long {
+        // Crop the center 70% of the image to focus on card contents and ignore outer camera frame/desk background
+        val width = bitmap.width
+        val height = bitmap.height
+        val cropW = (width * 0.70).toInt().coerceAtLeast(1)
+        val cropH = (height * 0.70).toInt().coerceAtLeast(1)
+        val startX = (width - cropW) / 2
+        val startY = (height - cropH) / 2
+        
+        val cropped = try {
+            Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
+        } catch (e: Exception) {
+            bitmap
+        }
+
+        // Resize to 9x8 to compute a 64-bit gradient hash
+        val scaled = Bitmap.createScaledBitmap(cropped, 9, 8, true)
+        val pixels = IntArray(72)
+        scaled.getPixels(pixels, 0, 9, 0, 0, 9, 8)
+        
+        // Convert to grayscale
+        val gray = IntArray(72)
+        for (i in 0 until 72) {
+            val p = pixels[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            gray[i] = (r * 0.299 + g * 0.587 + b * 0.114).toInt()
+        }
+        
+        if (scaled != cropped) {
+            scaled.recycle()
+        }
+        if (cropped != bitmap) {
+            cropped.recycle()
+        }
+        
+        // 8x8 matrix comparisons (64 bits)
+        var hash = 0L
+        for (y in 0 until 8) {
+            for (x in 0 until 8) {
+                val left = gray[y * 9 + x]
+                val right = gray[y * 9 + x + 1]
+                if (left > right) {
+                    hash = hash or (1L shl (y * 8 + x))
+                }
+            }
+        }
+        return hash
+    }
+
+    private fun getHammingDistance(h1: Long, h2: Long): Int {
+        var dist = 0
+        var valDiff = h1 xor h2
+        while (valDiff != 0L) {
+            dist++
+            valDiff = valDiff and (valDiff - 1)
+        }
+        return dist
+    }
     
     // Configured with high timeouts for image processing
     private val client = OkHttpClient.Builder()
@@ -79,6 +176,211 @@ object GeminiCardScanner {
 
         try {
             val bitmap = resizeBitmapIfRequired(rawBitmap, 1600)
+
+            // Calculate similarity signature hash and check in cache
+            val inputHash = calculateDHash(bitmap)
+            synchronized(scanCache) {
+                for (entry in scanCache) {
+                    val distance = getHammingDistance(entry.dHash, inputHash)
+                    if (distance <= 16) {
+                        Log.d(TAG, "⚡ Cache hit! Highly similar image already scanned (dHash Hamming distance=$distance). Returning result directly: ${entry.result.name} (${entry.result.serialNumber})")
+                        return@withContext entry.result.copy(isFromCache = true)
+                    }
+                }
+            }
+
+            // 2. Use free local ML Kit Text Recognition on cache miss
+            try {
+                Log.d(TAG, "📱 Cache miss. Running local ML Kit Text Recognition...")
+                val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                val inputImage = InputImage.fromBitmap(bitmap, 0)
+                val visionText = Tasks.await(recognizer.process(inputImage))
+                val fullText = visionText.text
+                Log.d(TAG, "Local OCR detected text:\n$fullText")
+                
+                val allBlocks = visionText.textBlocks
+                val allLines = allBlocks.flatMap { it.lines }
+                
+                val regex = java.util.regex.Pattern.compile(
+                    "([A-Za-z0-9]+)/([A-Za-z0-9]+)-([A-Za-z0-9]+)(?:\\s+([A-Za-z]+))?",
+                    java.util.regex.Pattern.CASE_INSENSITIVE
+                )
+                
+                var serialLine: com.google.mlkit.vision.text.Text.Line? = null
+                var matchedSerial: String? = null
+                
+                for (line in allLines) {
+                    val cleanLineText = line.text.trim()
+                        .replace("\\", "/")
+                        .replace("|", "/")
+                    val matcher = regex.matcher(cleanLineText)
+                    if (matcher.find()) {
+                        val matched = matcher.group(0) ?: ""
+                        if (matched.isNotEmpty()) {
+                            serialLine = line
+                            matchedSerial = matched
+                            break
+                        }
+                    }
+                }
+                
+                if (matchedSerial != null && serialLine != null) {
+                    Log.d(TAG, "📱 Local OCR Success! WS Serial: $matchedSerial")
+                    
+                    // 1. Extract card name from the line closest above the serial line
+                    var detectedName: String? = null
+                    var bestNameLine: com.google.mlkit.vision.text.Text.Line? = null
+                    var minDistance = Float.MAX_VALUE
+                    
+                    val serialBox = serialLine.boundingBox
+                    val serialCenterY = serialBox?.let { (it.top + it.bottom) / 2f }
+                    
+                    for (line in allLines) {
+                        val lineText = line.text.trim()
+                        if (lineText.isEmpty() || lineText.length < 2) continue
+                        if (line == serialLine) continue
+                        
+                        // Ignore if it matches the serial regex itself
+                        val cleanedText = lineText.replace("\\", "/").replace("|", "/")
+                        if (regex.matcher(cleanedText).find()) continue
+                        
+                        // Ignore standard Weiss Schwarz templates/headers/card watermark
+                        if (lineText.contains("WEISS", ignoreCase = true) || 
+                            lineText.contains("SCHWARZ", ignoreCase = true) ||
+                            lineText.contains("GRAPHIC", ignoreCase = true) ||
+                            lineText.contains("EMULATOR", ignoreCase = true) ||
+                            lineText.contains("DYNAMIC", ignoreCase = true) ||
+                            lineText.contains("RENDERER", ignoreCase = true)) continue
+                        
+                        val lineBox = line.boundingBox
+                        if (lineBox != null && serialBox != null && serialCenterY != null) {
+                            val lineCenterY = (lineBox.top + lineBox.bottom) / 2f
+                            
+                            // Must be visually above the serial line
+                            if (lineCenterY < serialCenterY) {
+                                val dist = serialBox.top - lineBox.bottom
+                                if (dist > -15) { // allow slight vertical overlap due to rotation/tilt
+                                    if (dist < minDistance) {
+                                        minDistance = dist.toFloat()
+                                        bestNameLine = line
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Sequential fallback if geometric search did not yield a line
+                    if (bestNameLine == null) {
+                        val serialIndex = allLines.indexOf(serialLine)
+                        if (serialIndex > 0) {
+                            // Find the non-empty, non-serial line closest before serialLine in the list
+                            for (i in (serialIndex - 1) downTo 0) {
+                                val candidate = allLines[i]
+                                val text = candidate.text.trim()
+                                if (text.length >= 2 && 
+                                    !text.contains("WEISS", ignoreCase = true) && 
+                                    !text.contains("SCHWARZ", ignoreCase = true) && 
+                                    !text.contains("GRAPHIC", ignoreCase = true) && 
+                                    !text.contains("EMULATOR", ignoreCase = true) &&
+                                    !regex.matcher(text.replace("\\", "/").replace("|", "/")).find()
+                                ) {
+                                    bestNameLine = candidate
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (bestNameLine != null) {
+                        var rawName = bestNameLine.text.trim()
+                        // Clean up any common noise like brackets from mock cards or leading/trailing chars
+                        rawName = rawName.removeSurrounding("【", "】")
+                            .removeSurrounding("[", "]")
+                            .removePrefix("Name:")
+                            .removePrefix("名稱:")
+                            .trim()
+                        if (rawName.isNotEmpty()) {
+                            detectedName = rawName
+                        }
+                        Log.d(TAG, "📱 Local OCR Extracted Card Name: $detectedName")
+                    }
+                    
+                    // 2. Extract traits from lines below the serial line
+                    val traitsCandidates = mutableListOf<String>()
+                    if (serialBox != null && serialCenterY != null) {
+                        for (line in allLines) {
+                            if (line == serialLine || line == bestNameLine) continue
+                            val lineBox = line.boundingBox
+                            if (lineBox != null) {
+                                val lineCenterY = (lineBox.top + lineBox.bottom) / 2f
+                                if (lineCenterY > serialCenterY) {
+                                    val dist = lineBox.top - serialBox.bottom
+                                    if (dist > -15 && dist < 120) {
+                                        val text = line.text.trim()
+                                        if (text.isNotEmpty() && 
+                                            text.length >= 2 &&
+                                            !text.contains("EMULATOR", ignoreCase = true) && 
+                                            !text.contains("RENDERER", ignoreCase = true) &&
+                                            !text.contains("DYNAMIC", ignoreCase = true) &&
+                                            !regex.matcher(text.replace("\\", "/").replace("|", "/")).find()
+                                        ) {
+                                            traitsCandidates.add(text)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    val detectedTraits = if (traitsCandidates.isNotEmpty()) {
+                        traitsCandidates.joinToString(", ")
+                            .replace("Traits:", "")
+                            .replace("特色:", "")
+                            .trim()
+                    } else null
+                    Log.d(TAG, "📱 Local OCR Extracted Traits: $detectedTraits")
+                    
+                    // Cross-reference with collection (knownCards) to restore character name and traits for free
+                    val matchedKnownCard = knownCards.find {
+                        val normSource = it.serialNumber.filter { char -> char.isLetterOrDigit() }.uppercase(java.util.Locale.getDefault())
+                        val normTarget = matchedSerial.filter { char -> char.isLetterOrDigit() }.uppercase(java.util.Locale.getDefault())
+                        normSource == normTarget
+                    }
+                    
+                    val result = if (matchedKnownCard != null) {
+                        CardScanResult(
+                            name = matchedKnownCard.name,
+                            serialNumber = matchedKnownCard.serialNumber, // Maintain original formatting
+                            traits = matchedKnownCard.traits,
+                            isFromLocalOcr = true
+                        )
+                    } else {
+                        val setAbbr = matchedSerial.substringBefore("/").uppercase(java.util.Locale.getDefault())
+                        CardScanResult(
+                            name = detectedName ?: "本地辨識卡牌 ($setAbbr)",
+                            serialNumber = matchedSerial,
+                            traits = detectedTraits ?: "本地辨識",
+                            isFromLocalOcr = true
+                        )
+                    }
+                    
+                    // Cache the successful local OCR result
+                    synchronized(scanCache) {
+                        val alreadyExists = scanCache.any { getHammingDistance(it.dHash, inputHash) <= 16 }
+                        if (!alreadyExists) {
+                            scanCache.add(0, CacheEntry(inputHash, result.copy(isFromCache = false)))
+                            while (scanCache.size > MAX_CACHE_SIZE) {
+                                scanCache.removeAt(scanCache.size - 1)
+                            }
+                        }
+                    }
+                    
+                    return@withContext result
+                } else {
+                    Log.d(TAG, "📱 Local OCR did not find a valid Weiss Schwarz serial code. Falling through to cloud Gemini API...")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "📱 Local OCR processing failed or skipped", e)
+            }
 
             val promptText = """
                 You are an elite trading card recognition AI.
@@ -208,7 +510,19 @@ object GeminiCardScanner {
             }
             
             if (successResult != null) {
-                return@withContext successResult!!
+                // Save successful scan result to Cache of up to 10 items max
+                val result = successResult!!.copy(isFromCache = false)
+                synchronized(scanCache) {
+                    val alreadyExists = scanCache.any { getHammingDistance(it.dHash, inputHash) <= 16 }
+                    if (!alreadyExists) {
+                        scanCache.add(0, CacheEntry(inputHash, result))
+                        while (scanCache.size > MAX_CACHE_SIZE) {
+                            scanCache.removeAt(scanCache.size - 1)
+                        }
+                        Log.d(TAG, "Cached successful scan result. Current cache size: ${scanCache.size}")
+                    }
+                }
+                return@withContext result
             } else {
                 return@withContext CardScanResult(
                     name = "",

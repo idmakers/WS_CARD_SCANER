@@ -44,6 +44,26 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.getDatabase(application)
     private val repository = CardRepository(database.cardDao)
 
+    init {
+        // Clear all temporary images inside cacheDir from previous runs
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val cacheDir = application.cacheDir
+                val tempFiles = cacheDir.listFiles { _, name ->
+                    name.startsWith("camera_raw_") || name.startsWith("cam_manual_")
+                }
+                tempFiles?.forEach { file ->
+                    if (file.exists()) {
+                        file.delete()
+                        Log.d("CardViewModel", "Pruned stale temp cache file: ${file.name}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("CardViewModel", "Failed to clean old cache files on start", e)
+            }
+        }
+    }
+
     // SharedPreferences for persistent billing info
     private val prefs = application.getSharedPreferences("billing_token_prefs", Context.MODE_PRIVATE)
 
@@ -138,6 +158,12 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
         private set
 
     var lastScannedCard by mutableStateOf<CardEntity?>(null)
+        private set
+
+    var lastScanIsFromCache by mutableStateOf(false)
+        private set
+
+    var lastScanIsFromLocalOcr by mutableStateOf(false)
         private set
 
     // Combined Flow for UI list reactively matching search and sorting
@@ -238,9 +264,23 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
                         serialNumber = response.serialNumber,
                         traits = response.traits
                     )
+                    
+                    // Refund credit since it was served for free from cache or local ML Kit!
+                    if (!isTester && (response.isFromCache || response.isFromLocalOcr)) {
+                        remainingScans = (remainingScans + 1).coerceAtMost(99999)
+                        saveBillingState()
+                    }
+                    
                     if (updatedIndex != -1) {
+                        val sourceLabel = if (response.isFromCache) {
+                            "⚡ [快取]"
+                        } else if (response.isFromLocalOcr) {
+                            "📱 [本地]"
+                        } else {
+                            "🌐 [API]"
+                        }
                         activeBackgroundScans[updatedIndex] = activeBackgroundScans[updatedIndex].copy(
-                            status = "成功: ${scannedCard.name} (${scannedCard.serialNumber})",
+                            status = "$sourceLabel 成功: ${scannedCard.name} (${scannedCard.serialNumber})",
                             isSuccess = true
                         )
                     }
@@ -285,13 +325,26 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
             isScanning = true
             scanError = null
             lastScannedCard = null
+            lastScanIsFromCache = false
+            lastScanIsFromLocalOcr = false
             
             try {
                 val response = GeminiCardScanner.scanCardImage(bitmap, known, isContinuousMode = false)
                 
                 if (response.error != null) {
                     scanError = response.error
+                    lastScanIsFromCache = false
+                    lastScanIsFromLocalOcr = false
                 } else {
+                    lastScanIsFromCache = response.isFromCache
+                    lastScanIsFromLocalOcr = response.isFromLocalOcr
+                    
+                    // Refund credit since it was served for free from cache or local ML Kit!
+                    if (!isTester && (response.isFromCache || response.isFromLocalOcr)) {
+                        remainingScans = (remainingScans + 1).coerceAtMost(99999)
+                        saveBillingState()
+                    }
+                    
                     // Success! Insert or increment card data
                     val scannedCard = insertOrIncrementCard(
                         name = response.name,
@@ -342,20 +395,28 @@ class CardViewModel(application: Application) : AndroidViewModel(application) {
         targetCard
     }
 
+    private fun normalizeSerialNumberForComparison(serial: String): String {
+        return serial.filter { it.isLetterOrDigit() }.uppercase(java.util.Locale.getDefault())
+    }
+
     private fun queryMatchedCard(name: String, serialNumber: String): CardEntity? {
-        // Let's do a fast query directly or match in RAM for prototype sanity
-        // Standard room find is cleaner inside DAO, but standard Kotlin match from Flow item is perfectly fine since the database is small
-        // To keep database query simple, we can block briefly on Dispatchers.IO to find match
-        // Or write a specialized DAO query, which is extremely elegant and standard! Let's write matches in repository
-        // Since we want standard offline performance, let's keep it clean
-        // We'll write direct database lookup. Wait, we can also match in ViewModel flow, let's retrieve current list and search.
         var matchedItem: CardEntity? = null
         try {
-            // A simple DAO lookup is best. Let's look up elements or match inside current state list!
             val elements = cardsState.value
-            matchedItem = elements.find { card ->
-                card.name.trim().lowercase() == name.trim().lowercase() &&
-                card.serialNumber.trim().lowercase() == serialNumber.trim().lowercase()
+            val normInput = normalizeSerialNumberForComparison(serialNumber)
+            
+            if (normInput.isNotEmpty()) {
+                matchedItem = elements.find { card ->
+                    val normCard = normalizeSerialNumberForComparison(card.serialNumber)
+                    normCard.isNotEmpty() && normCard == normInput
+                }
+            }
+            
+            // Fallback: match by name ignoring uppercase/lowercase if serial is empty
+            if (matchedItem == null && name.trim().isNotEmpty()) {
+                matchedItem = elements.find { card ->
+                    card.name.trim().equals(name.trim(), ignoreCase = true)
+                }
             }
         } catch (e: Exception) {
             Log.e("CardViewModel", "Error finding matching card", e)

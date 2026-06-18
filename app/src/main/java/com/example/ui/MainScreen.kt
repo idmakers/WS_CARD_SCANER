@@ -30,6 +30,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -93,6 +97,68 @@ fun rotateImageIfRequired(context: android.content.Context, img: Bitmap, selecte
         input.close()
     }
     return img
+}
+
+fun cropToCardFrame(bitmap: Bitmap): Bitmap {
+    try {
+        val imageW = bitmap.width.toFloat()
+        val imageH = bitmap.height.toFloat()
+        
+        // Match the layout screen dimensions from system metrics
+        val displayMetrics = android.content.res.Resources.getSystem().displayMetrics
+        val screenW = displayMetrics.widthPixels.toFloat()
+        val screenH = displayMetrics.heightPixels.toFloat()
+        
+        // Live camera preview scale inside PreviewView with FILL_CENTER:
+        // Maintains aspect ratio, expands image to fully fill the screen container, cropping the overflow.
+        val scale = maxOf(screenW / imageW, screenH / imageH)
+        val scaledW = imageW * scale
+        val scaledH = imageH * scale
+        
+        // Relative alignment offsets inside PreviewView
+        val offsetX = (screenW - scaledW) / 2f
+        val offsetY = (screenH - scaledH) / 2f
+        
+        // Exact visual guide frame drawn on top of the live preview (75% screen width, 1.4 aspect ratio, -40px shift)
+        val targetW = screenW * 0.75f
+        val targetH = targetW * 1.4f
+        val boxLeft = (screenW - targetW) / 2f
+        val boxTop = (screenH - targetH) / 2f - 40f
+        
+        // Convert screen coordinates back into actual bitmap coordinates (inverse of scale/transform)
+        val cropLeft = ((boxLeft - offsetX) / scale).toInt().coerceIn(0, bitmap.width)
+        val cropTop = ((boxTop - offsetY) / scale).toInt().coerceIn(0, bitmap.height)
+        val cropRight = (((boxLeft + targetW) - offsetX) / scale).toInt().coerceIn(0, bitmap.width)
+        val cropBottom = (((boxTop + targetH) - offsetY) / scale).toInt().coerceIn(0, bitmap.height)
+        
+        val cropW = (cropRight - cropLeft).coerceIn(1, bitmap.width - cropLeft)
+        val cropH = (cropBottom - cropTop).coerceIn(1, bitmap.height - cropTop)
+        
+        val cropped = Bitmap.createBitmap(bitmap, cropLeft, cropTop, cropW, cropH)
+        if (cropped != bitmap) {
+            bitmap.recycle()
+        }
+        android.util.Log.d("CardCropper", "Precise crop from ${bitmap.width}x${bitmap.height} to ${cropped.width}x${cropped.height} matched to screen size ${screenW.toInt()}x${screenH.toInt()} (cropLeft=$cropLeft, cropTop=$cropTop)")
+        return cropped
+    } catch (e: Exception) {
+        android.util.Log.e("CardCropper", "Precise cropping failed, returning fallback crop or original", e)
+        // Fallback to proportional center crop
+        try {
+            val width = bitmap.width
+            val height = bitmap.height
+            val cropW = (width * 0.75f).toInt().coerceIn(1, width)
+            val cropH = (cropW * 1.4f).toInt().coerceIn(1, height)
+            val startX = (width - cropW) / 2
+            val startY = ((height - cropH) / 2 - (height * 0.05f).toInt()).coerceAtLeast(0)
+            val cropped = Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
+            if (cropped != bitmap) {
+                bitmap.recycle()
+            }
+            return cropped
+        } catch (inner: Exception) {
+            return bitmap
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -278,6 +344,8 @@ fun MainScreen(viewModel: CardViewModel = viewModel()) {
                         isScanning = viewModel.isScanning,
                         scanError = viewModel.scanError,
                         lastScannedCard = viewModel.lastScannedCard,
+                        lastScanIsFromCache = viewModel.lastScanIsFromCache,
+                        lastScanIsFromLocalOcr = viewModel.lastScanIsFromLocalOcr,
                         customName = customName,
                         customSerial = customSerial,
                         customTraits = customTraits,
@@ -539,6 +607,8 @@ fun ScannerPanel(
     isScanning: Boolean,
     scanError: String?,
     lastScannedCard: CardEntity?,
+    lastScanIsFromCache: Boolean = false,
+    lastScanIsFromLocalOcr: Boolean = false,
     customName: String,
     customSerial: String,
     customTraits: String,
@@ -1025,10 +1095,26 @@ fun ScannerPanel(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = if (scanError != null) "❌ 掃描失敗" else "🎉 辨識統計完成",
+                                text = if (scanError != null) {
+                                    "❌ 掃描失敗"
+                                } else if (lastScanIsFromCache) {
+                                    "⚡ 辨識統計完成 (來自快取)"
+                                } else if (lastScanIsFromLocalOcr) {
+                                    "📱 辨識統計完成 (來自本地辨識)"
+                                } else {
+                                    "🌐 辨識統計完成 (來自 Gemini API)"
+                                },
                                 fontWeight = FontWeight.ExtraBold,
-                                color = if (scanError != null) Color(0xFFC62828) else Color(0xFF2E7D32),
-                                fontSize = 14.sp
+                                color = if (scanError != null) {
+                                    Color(0xFFC62828)
+                                } else if (lastScanIsFromCache) {
+                                    Color(0xFF2E7D32)
+                                } else if (lastScanIsFromLocalOcr) {
+                                    Color(0xFF00796B)
+                                } else {
+                                    Color(0xFF1565C0)
+                                },
+                                fontSize = 13.sp
                             )
                             
                             Icon(
@@ -1051,12 +1137,39 @@ fun ScannerPanel(
                             )
                         } else if (lastScannedCard != null) {
                             Column {
-                                Text(
-                                    text = "已統計卡片資訊：",
-                                    color = Color(0xFF475569),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "已統計卡片資訊：",
+                                        color = Color(0xFF475569),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    
+                                    val sourceText = if (lastScanIsFromCache) {
+                                        "⚡ 命中快取 (不花額度)"
+                                    } else if (lastScanIsFromLocalOcr) {
+                                        "📱 本地 Text Recognition (免雲端/免費)"
+                                    } else {
+                                        "📡 Gemini 視覺解析 (花額度)"
+                                    }
+                                    val sourceColor = if (lastScanIsFromCache) {
+                                        Color(0xFF2E7D32)
+                                    } else if (lastScanIsFromLocalOcr) {
+                                        Color(0xFF00796B)
+                                    } else {
+                                        Color(0xFFE65100)
+                                    }
+                                    Text(
+                                        text = sourceText,
+                                        color = sourceColor,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                }
                                 Spacer(modifier = Modifier.height(4.dp))
                                 
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1953,14 +2066,30 @@ fun InAppCameraDialog(
                                         val bitmap = BitmapFactory.decodeFile(file.absolutePath)
                                         if (bitmap != null) {
                                             val rotated = rotateImageIfRequired(context, bitmap, Uri.fromFile(file))
-                                            onPhotoCaptured(rotated)
+                                            val cropped = cropToCardFrame(rotated)
+                                            onPhotoCaptured(cropped)
                                         }
                                     } catch (e: Exception) {
                                         android.util.Log.e("Camera", "Failed to decode background picture", e)
+                                    } finally {
+                                        try {
+                                            if (file.exists()) {
+                                                file.delete()
+                                            }
+                                        } catch (ex: Exception) {
+                                            android.util.Log.e("Camera", "Failed to delete auto shutter temp file", ex)
+                                        }
                                     }
                                 }
                                 override fun onError(exception: ImageCaptureException) {
                                     android.util.Log.e("Camera", "Failed capture", exception)
+                                    try {
+                                        if (file.exists()) {
+                                            file.delete()
+                                        }
+                                    } catch (ex: Exception) {
+                                        // ignore
+                                    }
                                 }
                             }
                         )
@@ -1992,6 +2121,97 @@ fun InAppCameraDialog(
                         imageCapture = imageCapture,
                         modifier = Modifier.fillMaxSize()
                     )
+                    
+                    // Card Identification Target Frame overlay with centering bounds, semi-transparent mask and corner metrics
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val canvasWidth = size.width
+                        val canvasHeight = size.height
+                        
+                        val targetWidth = canvasWidth * 0.75f
+                        val targetHeight = targetWidth * 1.4f
+                        
+                        val left = (canvasWidth - targetWidth) / 2f
+                        val top = (canvasHeight - targetHeight) / 2f - 40f
+                        val right = left + targetWidth
+                        val bottom = top + targetHeight
+                        
+                        // 1. Top Section Mask
+                        drawRect(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            topLeft = Offset(0f, 0f),
+                            size = Size(canvasWidth, top)
+                        )
+                        // 2. Bottom Section Mask
+                        drawRect(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            topLeft = Offset(0f, bottom),
+                            size = Size(canvasWidth, canvasHeight - bottom)
+                        )
+                        // 3. Left Section Mask
+                        drawRect(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            topLeft = Offset(0f, top),
+                            size = Size(left, targetHeight)
+                        )
+                        // 4. Right Section Mask
+                        drawRect(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            topLeft = Offset(right, top),
+                            size = Size(canvasWidth - right, targetHeight)
+                        )
+                        
+                        // Draw sleek card guide frame
+                        drawRoundRect(
+                            color = Color(0xFF8B5CF6),
+                            topLeft = Offset(left, top),
+                            size = Size(targetWidth, targetHeight),
+                            cornerRadius = CornerRadius(16.dp.toPx()),
+                            style = Stroke(width = 2.dp.toPx())
+                        )
+                        
+                        // Corner tick marks for visual focus
+                        val cornerLen = 24.dp.toPx()
+                        val strokeW = 4.dp.toPx()
+                        val cornerColor = Color(0xFF10B981) // Emerald guide corners
+                        
+                        // Top-Left corner
+                        drawLine(color = cornerColor, start = Offset(left, top), end = Offset(left + cornerLen, top), strokeWidth = strokeW)
+                        drawLine(color = cornerColor, start = Offset(left, top), end = Offset(left, top + cornerLen), strokeWidth = strokeW)
+                        
+                        // Top-Right corner
+                        drawLine(color = cornerColor, start = Offset(right, top), end = Offset(right - cornerLen, top), strokeWidth = strokeW)
+                        drawLine(color = cornerColor, start = Offset(right, top), end = Offset(right, top + cornerLen), strokeWidth = strokeW)
+                        
+                        // Bottom-Left corner
+                        drawLine(color = cornerColor, start = Offset(left, bottom), end = Offset(left + cornerLen, bottom), strokeWidth = strokeW)
+                        drawLine(color = cornerColor, start = Offset(left, bottom), end = Offset(left, bottom - cornerLen), strokeWidth = strokeW)
+                        
+                        // Bottom-Right corner
+                        drawLine(color = cornerColor, start = Offset(right, bottom), end = Offset(right - cornerLen, bottom), strokeWidth = strokeW)
+                        drawLine(color = cornerColor, start = Offset(right, bottom), end = Offset(right, bottom - cornerLen), strokeWidth = strokeW)
+                    }
+                    
+                    // Guide Text Overlay positioned nicely below the card frame
+                    Box(
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.7f),
+                            shape = RoundedCornerShape(20.dp),
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .padding(top = 280.dp)
+                        ) {
+                            Text(
+                                text = "請將卡片放入綠色對齊框中\n系統將自動裁切不必要的背景",
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                            )
+                        }
+                    }
                     
                     // Flash White Overlay on trigger
                     if (triggerFlash) {
@@ -2154,15 +2374,31 @@ fun InAppCameraDialog(
                                                                     val bitmap = BitmapFactory.decodeFile(file.absolutePath)
                                                                     if (bitmap != null) {
                                                                         val rotated = rotateImageIfRequired(context, bitmap, Uri.fromFile(file))
-                                                                        onPhotoCaptured(rotated)
+                                                                        val cropped = cropToCardFrame(rotated)
+                                                                        onPhotoCaptured(cropped)
                                                                         Toast.makeText(context, "已新增至掃描佇列！", Toast.LENGTH_SHORT).show()
                                                                     }
                                                                 } catch (e: Exception) {
                                                                     Toast.makeText(context, "讀取影像異常", Toast.LENGTH_SHORT).show()
+                                                                } finally {
+                                                                    try {
+                                                                        if (file.exists()) {
+                                                                            file.delete()
+                                                                        }
+                                                                    } catch (ex: Exception) {
+                                                                        android.util.Log.e("Camera", "Failed to delete manual shutter temp file", ex)
+                                                                    }
                                                                 }
                                                             }
                                                             override fun onError(exception: ImageCaptureException) {
                                                                 Toast.makeText(context, "拍照失敗: ${exception.message}", Toast.LENGTH_SHORT).show()
+                                                                try {
+                                                                    if (file.exists()) {
+                                                                        file.delete()
+                                                                    }
+                                                                } catch (ex: Exception) {
+                                                                    // ignore
+                                                                }
                                                             }
                                                         }
                                                     )
